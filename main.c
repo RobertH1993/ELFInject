@@ -95,17 +95,14 @@ Elf64_Phdr* find_elf_gap(uint8_t *data, Elf64_Ehdr* elf_header, uint64_t *gap_of
 }
 
 
-Elf64_Shdr *
-elfi_find_section (uint8_t *data, char *name)
-{
-  char        *sname;
-  int         i;
+Elf64_Shdr * elfi_find_section (uint8_t *data, char *name){
   Elf64_Ehdr* elf_hdr = (Elf64_Ehdr *) data;
   Elf64_Shdr *shdr = (Elf64_Shdr *)(data + elf_hdr->e_shoff);
   Elf64_Shdr *sh_strtab = &shdr[elf_hdr->e_shstrndx];
   const char *const sh_strtab_p = data + sh_strtab->sh_offset;
  
-  for (i = 0; i < elf_hdr->e_shnum; i++)
+  char *sname = NULL;
+  for (uint16_t i = 0; i < elf_hdr->e_shnum; i++)
     {
       sname = (char*) (sh_strtab_p + shdr[i].sh_name);
       if (!strcmp (sname, name))  return &shdr[i];
